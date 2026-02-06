@@ -23,25 +23,24 @@ export function activate(context: vscode.ExtensionContext): void {
     // Register commands
     const commands = [
         {
-            id: 'imageUploader.uploadFromClipboard.editor',
+            id: 'remotepix.uploadFromClipboard.editor',
             destination: 'editor' as InsertDestination
         },
         {
-            id: 'imageUploader.uploadFromClipboard.terminal',
+            id: 'remotepix.uploadFromClipboard.terminal',
             destination: 'terminal' as InsertDestination
         }
     ];
 
     const disposables = commands.map(({ id, destination }) =>
-        vscode.commands.registerCommand(id, () => 
+        vscode.commands.registerCommand(id, () =>
             handleUploadCommand(destination, dependencies)
         )
     );
 
     // Register configuration change handler
     const configDisposable = config.onConfigurationChanged((newConfig) => {
-        console.log('Extension configuration updated:', newConfig);
-        // Here you could update services that depend on configuration
+        console.log('Remotepix configuration updated:', newConfig);
     });
 
     // Add all disposables to context
@@ -52,9 +51,9 @@ export function activate(context: vscode.ExtensionContext): void {
         // Silently fail - warming up is best effort
     });
 
-    console.log('Claudeboard extension activated');
+    console.log('Remotepix extension activated');
 }
 
 export function deactivate(): void {
-    console.log('Claudeboard extension deactivated');
+    console.log('Remotepix extension deactivated');
 }

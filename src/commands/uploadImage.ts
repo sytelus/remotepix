@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { ClipboardService, ImageData } from '../services/clipboard';
 import { FileManagerService, ImageFile } from '../services/fileManager';
-import { ProgressService, ProgressPatterns, ProgressSteps } from '../services/progress';
+import { ProgressService, ProgressSteps } from '../services/progress';
 import { ConfigurationService } from '../services/configuration';
 import { Result, success, failure, ExtensionResult, ClipboardError, FileSystemError } from '../common/result';
 
@@ -18,141 +18,12 @@ export interface CommandDependencies {
     config: ConfigurationService;
 }
 
-class ImageUploadCommand implements UploadImageCommand {
-    constructor(private readonly deps: CommandDependencies) {}
+// Result type for clipboard check - distinguishes between "no image" and "error"
+type ClipboardCheckResult =
+    | { type: 'image'; data: ImageData }
+    | { type: 'no_image' }
+    | { type: 'error'; error: ClipboardError };
 
-    async execute(destination: InsertDestination): Promise<ExtensionResult<string>> {
-        // Validate remote connection first
-        const remoteCheck = this.validateRemoteConnection();
-        if (Result.isFailure(remoteCheck)) {
-            return remoteCheck;
-        }
-
-        return await this.deps.progress.withSequentialProgress(
-            ProgressPatterns.IMAGE_UPLOAD_WORKFLOW,
-            [
-                () => this.checkClipboard(),
-                (reporter) => this.uploadAndInsert(destination, reporter)
-            ]
-        );
-    }
-
-    private validateRemoteConnection(): ExtensionResult<void> {
-        if (!vscode.env.remoteName) {
-            return failure(new ClipboardError(
-                'No remote connection detected. Please connect to a server using Remote-SSH to upload images.',
-                { remoteName: vscode.env.remoteName }
-            ));
-        }
-        return success(undefined);
-    }
-
-    private async checkClipboard(): Promise<ExtensionResult<ImageData>> {
-        try {
-            const imageData = await this.deps.clipboard.getImage();
-            
-            if (!imageData) {
-                return failure(new ClipboardError('No image found in clipboard'));
-            }
-
-            return success(imageData);
-        } catch (error) {
-            return failure(new ClipboardError(
-                'Failed to access clipboard',
-                { originalError: error }
-            ));
-        }
-    }
-
-    private async uploadAndInsert(
-        destination: InsertDestination,
-        reporter: any
-    ): Promise<ExtensionResult<string>> {
-        reporter.report(ProgressSteps.preparing());
-
-        try {
-            // Get image from previous step's result - this is a simplified approach
-            // In a more complex implementation, we'd pass results between steps
-            const imageData = await this.deps.clipboard.getImage();
-            if (!imageData) {
-                return failure(new ClipboardError('Image no longer available in clipboard'));
-            }
-
-            // Cleanup old images based on user configuration
-            const retentionDays = this.deps.config.getRetentionDays();
-            await this.deps.fileManager.cleanupOldImages(retentionDays);
-
-            reporter.report(ProgressSteps.uploading());
-
-            // Create image file
-            const imageFile = await this.deps.fileManager.createImageFile(
-                imageData.buffer,
-                imageData.format
-            );
-
-            reporter.report(ProgressSteps.inserting());
-
-            // Insert URL into editor/terminal
-            const insertResult = await this.insertImageUrl(imageFile.getPath(), destination);
-            if (Result.isFailure(insertResult)) {
-                imageFile.dispose();
-                return insertResult;
-            }
-
-            reporter.report(ProgressSteps.cleaning());
-
-            // Clear clipboard if configured to do so
-            if (this.deps.config.getClearClipboardAfterUpload()) {
-                await this.deps.clipboard.clear();
-            }
-
-            const imageUrl = imageFile.getPath();
-            
-            // Show success message
-            vscode.window.showInformationMessage(`Image uploaded: ${imageUrl}`);
-
-            return success(imageUrl);
-
-        } catch (error) {
-            return failure(new FileSystemError(
-                'Failed to upload image',
-                { originalError: error, destination }
-            ));
-        }
-    }
-
-    private async insertImageUrl(url: string, destination: InsertDestination): Promise<ExtensionResult<void>> {
-        try {
-            if (destination === 'editor') {
-                const activeEditor = vscode.window.activeTextEditor;
-                if (!activeEditor) {
-                    return failure(new FileSystemError('No active editor available'));
-                }
-
-                const position = activeEditor.selection.active;
-                await activeEditor.edit(editBuilder => {
-                    editBuilder.insert(position, url);
-                });
-            } else if (destination === 'terminal') {
-                const activeTerminal = vscode.window.activeTerminal;
-                if (!activeTerminal) {
-                    return failure(new FileSystemError('No active terminal available'));
-                }
-
-                activeTerminal.sendText(url, false);
-            }
-
-            return success(undefined);
-        } catch (error) {
-            return failure(new FileSystemError(
-                `Failed to insert image URL into ${destination}`,
-                { originalError: error, destination, url }
-            ));
-        }
-    }
-}
-
-// Optimized version that passes results between steps
 class OptimizedImageUploadCommand implements UploadImageCommand {
     constructor(private readonly deps: CommandDependencies) {}
 
@@ -163,21 +34,31 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
             return remoteCheck;
         }
 
-        // Step 1: Check clipboard
-        const clipboardResult = await this.deps.progress.withProgress(
-            "Checking clipboard...",
-            () => this.checkClipboard()
-        );
+        // Step 1: Check clipboard - this determines whether to proceed or pass through
+        const clipboardCheck = await this.checkClipboardWithPassthrough();
 
-        if (Result.isFailure(clipboardResult)) {
-            vscode.window.showWarningMessage(clipboardResult.error.message);
-            return clipboardResult;
+        if (clipboardCheck.type === 'no_image') {
+            // No image on clipboard - pass through to normal paste for terminal
+            if (destination === 'terminal') {
+                await vscode.commands.executeCommand('workbench.action.terminal.paste');
+            }
+            // For editor, the user expects paste behavior, but we don't intercept Ctrl+V there
+            // so this case shouldn't happen in normal usage
+            return success('passthrough');
         }
+
+        if (clipboardCheck.type === 'error') {
+            vscode.window.showWarningMessage(clipboardCheck.error.message);
+            return failure(clipboardCheck.error);
+        }
+
+        // We have an image - proceed with upload
+        const imageData = clipboardCheck.data;
 
         // Step 2: Upload and insert
         return await this.deps.progress.withProgress(
-            `Uploading image to Server...`,
-            (reporter) => this.uploadAndInsert(clipboardResult.data, destination, reporter)
+            `Uploading image to server...`,
+            (reporter) => this.uploadAndInsert(imageData, destination, reporter)
         );
     }
 
@@ -191,20 +72,28 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
         return success(undefined);
     }
 
-    private async checkClipboard(): Promise<ExtensionResult<ImageData>> {
+    private async checkClipboardWithPassthrough(): Promise<ClipboardCheckResult> {
         try {
-            const imageData = await this.deps.clipboard.getImage();
-            
-            if (!imageData) {
-                return failure(new ClipboardError('No image found in clipboard'));
+            // First check if there's an image without fully retrieving it
+            const hasImage = await this.deps.clipboard.hasImage();
+
+            if (!hasImage) {
+                return { type: 'no_image' };
             }
 
-            return success(imageData);
+            // There is an image - get it
+            const imageData = await this.deps.clipboard.getImage();
+
+            if (!imageData) {
+                return { type: 'no_image' };
+            }
+
+            return { type: 'image', data: imageData };
         } catch (error) {
-            return failure(new ClipboardError(
-                'Failed to access clipboard',
-                { originalError: error }
-            ));
+            return {
+                type: 'error',
+                error: new ClipboardError('Failed to access clipboard', { originalError: error })
+            };
         }
     }
 
@@ -216,10 +105,6 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
         try {
             reporter.report(ProgressSteps.preparing());
 
-            // Cleanup old images first based on user configuration
-            const retentionDays = this.deps.config.getRetentionDays();
-            await this.deps.fileManager.cleanupOldImages(retentionDays);
-
             reporter.report(ProgressSteps.uploading());
 
             // Create image file
@@ -230,26 +115,27 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
 
             reporter.report(ProgressSteps.inserting());
 
-            // Insert URL into editor/terminal
-            const insertResult = await this.insertImageUrl(imageFile.getPath(), destination);
+            const imagePath = imageFile.getPath();
+
+            // Insert path into editor/terminal
+            const insertResult = await this.insertImagePath(imagePath, destination);
             if (Result.isFailure(insertResult)) {
                 imageFile.dispose();
                 return insertResult;
             }
 
-            reporter.report(ProgressSteps.cleaning());
-
-            // Clear clipboard if configured to do so
-            if (this.deps.config.getClearClipboardAfterUpload()) {
-                await this.deps.clipboard.clear();
+            // Update clipboard: add text path while keeping image (best effort)
+            try {
+                await this.deps.clipboard.setTextWithImage(imagePath, imageData.buffer);
+            } catch (error) {
+                // Clipboard update is best effort - don't fail the upload
+                console.warn('Failed to update clipboard with path:', error);
             }
 
-            const imageUrl = imageFile.getPath();
-            
             // Show success message
-            vscode.window.showInformationMessage(`Image uploaded: ${imageUrl}`);
+            vscode.window.showInformationMessage(`Image saved: ${imagePath}`);
 
-            return success(imageUrl);
+            return success(imagePath);
 
         } catch (error) {
             return failure(new FileSystemError(
@@ -259,7 +145,7 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
         }
     }
 
-    private async insertImageUrl(url: string, destination: InsertDestination): Promise<ExtensionResult<void>> {
+    private async insertImagePath(path: string, destination: InsertDestination): Promise<ExtensionResult<void>> {
         try {
             if (destination === 'editor') {
                 const activeEditor = vscode.window.activeTextEditor;
@@ -269,7 +155,7 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
 
                 const position = activeEditor.selection.active;
                 await activeEditor.edit(editBuilder => {
-                    editBuilder.insert(position, url);
+                    editBuilder.insert(position, path);
                 });
             } else if (destination === 'terminal') {
                 const activeTerminal = vscode.window.activeTerminal;
@@ -277,14 +163,14 @@ class OptimizedImageUploadCommand implements UploadImageCommand {
                     return failure(new FileSystemError('No active terminal available'));
                 }
 
-                activeTerminal.sendText(url, false);
+                activeTerminal.sendText(path, false);
             }
 
             return success(undefined);
         } catch (error) {
             return failure(new FileSystemError(
-                `Failed to insert image URL into ${destination}`,
-                { originalError: error, destination, url }
+                `Failed to insert image path into ${destination}`,
+                { originalError: error, destination, path }
             ));
         }
     }

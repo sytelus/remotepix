@@ -1,7 +1,7 @@
-# Claudeboard - VS Code Extension
+# Remotepix - VS Code Extension
 
 ## Project Overview
-A VS Code extension that shares images with Claude Code running on remote servers via Remote-SSH. Upload clipboard images instantly and get shareable file paths for seamless Claude Code workflows.
+A VS Code extension that shares images with AI coding agents running on remote servers via Remote-SSH. Upload clipboard images instantly and get shareable file paths for seamless AI coding workflows.
 
 ## Tech Stack
 - **Language:** TypeScript (strict mode)
@@ -63,25 +63,24 @@ npm run package             # Create VSIX file
 - **Robust macOS clipboard detection:** Multi-strategy approach (AppleScript + pbpaste fallback)
 - **Multiple image format support:** PNG, TIFF, JPEG with automatic format conversion
 - **Remote-SSH integration:** Seamless uploads to remote servers
-- **Configurable keybinding:** Choose from multiple keyboard shortcuts
-- **Auto-cleanup:** Configurable retention period (0-365 days)
+- **Ctrl+V interception:** Intercepts paste in terminal only when image is on clipboard
+- **Clipboard preservation:** Keeps image on clipboard while adding text path
 - **Dual context:** Works in both editor and terminal
 - **Progress indicators:** Real-time upload feedback
 - **Secure by design:** Uses existing SSH connections
 
 ## Configuration
 The extension provides these settings:
-- `imageUploader.keybinding`: Keyboard shortcut (ctrl+alt+v, ctrl+shift+v, alt+v, ctrl+v, f12)
-- `imageUploader.retentionDays`: Image retention period (0-365 days, 0=never delete)
+- `remotepix.keybinding`: Keyboard shortcut (ctrl+alt+v, ctrl+shift+v, alt+v, ctrl+v, f12)
 
 ## Commands
-- `imageUploader.uploadFromClipboard.editor`: Upload from clipboard (editor)
-- `imageUploader.uploadFromClipboard.terminal`: Upload from clipboard (terminal)
+- `remotepix.uploadFromClipboard.editor`: Upload from clipboard (editor)
+- `remotepix.uploadFromClipboard.terminal`: Upload from clipboard (terminal)
 
 ## Extension Requirements
 - VS Code version: ^1.74.0
 - Extension kind: UI (runs in main VS Code process)
-- Activation: On startup (all contexts)
+- Activation: On Remote-SSH connection
 
 ## Architecture
 - **Service-based design:** ClipboardService, FileManagerService, ProgressService, ConfigurationService
@@ -89,11 +88,15 @@ The extension provides these settings:
 - **Multi-strategy clipboard access:** AppleScript (primary) with pbpaste fallback for maximum compatibility
 - **Format conversion:** Automatic TIFF/JPEG to PNG conversion using native macOS tools
 - **Type safety:** TypeScript strict mode with Result<T,E> pattern
-- **Resource management:** RAII pattern for guaranteed cleanup
 - **Command pattern:** Decoupled business logic with dependency injection
+
+## Storage Location
+- Images are stored in `~/remotepix/` on the remote server
+- No automatic cleanup - images are kept indefinitely
+- File naming: `image_<timestamp>.png`
 
 ## Notes
 - No automated testing configured
 - Manual workflow preferred over GitHub Actions
 - Solo development project
-- Designed specifically for Claude Code workflows
+- Designed for AI coding agent workflows (Claude Code, Cursor, Copilot, Aider, etc.)

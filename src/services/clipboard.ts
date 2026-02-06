@@ -16,6 +16,7 @@ export interface ClipboardService {
     clear(): Promise<void>;
     hasImage(): Promise<boolean>;
     warmUp(): Promise<void>;
+    setTextWithImage(text: string, imageBuffer: Buffer): Promise<void>;
 }
 
 export interface Disposable {
@@ -48,10 +49,10 @@ class WindowsClipboardService implements ClipboardService {
 
     async getImage(): Promise<ClipboardResult> {
         const tempFile = this.createTempFile();
-        
+
         try {
             const hasImage = await this.executeClipboardCommand(tempFile.getPath());
-            
+
             if (!hasImage || !fs.existsSync(tempFile.getPath())) {
                 return null;
             }
@@ -68,7 +69,7 @@ class WindowsClipboardService implements ClipboardService {
 
     async clear(): Promise<void> {
         const command = 'powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::Clear()"';
-        
+
         return new Promise((resolve) => {
             exec(command, { timeout: 5000 }, () => {
                 resolve(); // Always resolve, cleanup is best effort
@@ -79,7 +80,7 @@ class WindowsClipboardService implements ClipboardService {
     async hasImage(): Promise<boolean> {
         const psCommand = 'Add-Type -AssemblyName System.Windows.Forms; if ([System.Windows.Forms.Clipboard]::ContainsImage()) { Write-Host "true" } else { Write-Host "false" }';
         const command = `powershell -NoProfile -Command "${psCommand}"`;
-        
+
         return new Promise((resolve, reject) => {
             exec(command, { timeout: 5000 }, (error, stdout) => {
                 if (error) {
@@ -94,7 +95,7 @@ class WindowsClipboardService implements ClipboardService {
     async warmUp(): Promise<void> {
         const psCommand = 'Add-Type -AssemblyName System.Windows.Forms';
         const command = `powershell -NoProfile -Command "${psCommand}"`;
-        
+
         return new Promise((resolve) => {
             exec(command, { timeout: 15000 }, () => {
                 resolve();
@@ -102,12 +103,61 @@ class WindowsClipboardService implements ClipboardService {
         });
     }
 
+    async setTextWithImage(text: string, imageBuffer: Buffer): Promise<void> {
+        // Save image to temp file
+        const tempFile = this.createTempFile();
+        const tempPath = tempFile.getPath();
+
+        try {
+            fs.writeFileSync(tempPath, imageBuffer);
+
+            // PowerShell script to set both text and image on clipboard
+            const escapedPath = tempPath.replace(/'/g, "''").replace(/\\/g, '\\\\');
+            const escapedText = text.replace(/'/g, "''").replace(/"/g, '""');
+
+            const psScript = `
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$dataObject = New-Object System.Windows.Forms.DataObject
+
+# Add text
+$dataObject.SetText('${escapedText}')
+
+# Add image
+$image = [System.Drawing.Image]::FromFile('${escapedPath}')
+$dataObject.SetImage($image)
+
+# Set clipboard with both
+[System.Windows.Forms.Clipboard]::SetDataObject($dataObject, $true)
+
+$image.Dispose()
+Write-Host "success"
+`;
+
+            const command = `powershell -NoProfile -ExecutionPolicy Bypass -Command "${psScript.replace(/\n/g, '; ')}"`;
+
+            await new Promise<void>((resolve, reject) => {
+                exec(command, { timeout: this.timeout }, (error, stdout, stderr) => {
+                    if (error) {
+                        console.warn('Failed to set clipboard with both text and image:', error);
+                        reject(error);
+                        return;
+                    }
+                    resolve();
+                });
+            });
+        } finally {
+            tempFile.dispose();
+        }
+    }
+
     private createTempFile(): ManagedTempFile {
         const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vscode-clipboard-'));
         const randomSuffix = crypto.randomBytes(8).toString('hex');
         const tempFile = path.join(tempDir, `clipboard-${randomSuffix}.png`);
         const fullPath = path.resolve(tempFile);
-        
+
         return new ManagedTempFile(fullPath, tempDir);
     }
 
@@ -208,6 +258,31 @@ class LinuxClipboardService implements ClipboardService {
         }
     }
 
+    async setTextWithImage(text: string, imageBuffer: Buffer): Promise<void> {
+        // Linux clipboard managers typically don't support multiple types simultaneously
+        // from command line tools. We'll set the text as that's most useful for AI workflows.
+        // The image was already saved to disk, so it's still accessible.
+
+        const escapedText = text.replace(/'/g, "'\\''");
+
+        // Try xclip first, then wl-copy
+        const commands = [
+            `echo -n '${escapedText}' | xclip -selection clipboard`,
+            `echo -n '${escapedText}' | wl-copy`
+        ];
+
+        for (const command of commands) {
+            try {
+                await this.executeCommand(command);
+                return;
+            } catch (error) {
+                continue;
+            }
+        }
+
+        console.warn('Failed to set clipboard text on Linux');
+    }
+
     private executeCommand(command: string): Promise<Buffer> {
         return new Promise((resolve, reject) => {
             exec(command, { encoding: 'buffer', timeout: 10000 }, (error, stdout) => {
@@ -269,7 +344,7 @@ class MacOSClipboardService implements ClipboardService {
                     return "false"
                 end if
             `;
-            
+
             const result = await this.executeAppleScript(script);
             return result.toString().trim() === 'true';
         } catch (error) {
@@ -277,9 +352,9 @@ class MacOSClipboardService implements ClipboardService {
             try {
                 const output = await this.executeCommand('osascript -e "clipboard info"');
                 const info = output.toString();
-                return info.includes('image') || 
-                       info.includes('PNGf') || 
-                       info.includes('TIFF') || 
+                return info.includes('image') ||
+                       info.includes('PNGf') ||
+                       info.includes('TIFF') ||
                        info.includes('JPEG');
             } catch {
                 return false;
@@ -304,11 +379,55 @@ class MacOSClipboardService implements ClipboardService {
         }
     }
 
+    async setTextWithImage(text: string, imageBuffer: Buffer): Promise<void> {
+        // Save image to temp file
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remotepix-'));
+        const tempPath = path.join(tempDir, 'image.png');
+
+        try {
+            fs.writeFileSync(tempPath, imageBuffer);
+
+            // AppleScript to set both text and image on clipboard
+            const escapedText = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            const escapedPath = tempPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+            const script = `
+                set theFile to POSIX file "${escapedPath}"
+                set theText to "${escapedText}"
+
+                -- Read the image file
+                set imageData to read theFile as «class PNGf»
+
+                -- Set clipboard with both text and image
+                set the clipboard to {«class PNGf»:imageData, «class utf8»:theText, string:theText}
+            `;
+
+            await this.executeAppleScript(script);
+        } catch (error) {
+            console.warn('Failed to set clipboard with both text and image on macOS:', error);
+            // Fallback: just set the text
+            try {
+                const escapedText = text.replace(/'/g, "'\\''");
+                await this.executeCommand(`echo -n '${escapedText}' | pbcopy`);
+            } catch {
+                // Best effort
+            }
+        } finally {
+            // Cleanup temp file
+            try {
+                fs.unlinkSync(tempPath);
+                fs.rmdirSync(tempDir);
+            } catch {
+                // Best effort cleanup
+            }
+        }
+    }
+
     private async getImageViaAppleScript(): Promise<Buffer> {
         const script = `
             set tempFile to (path to temporary items as text) & "clipboard_image_" & (random number from 1000 to 9999) & ".png"
             set posixPath to POSIX path of tempFile
-            
+
             try
                 set imageData to (the clipboard as «class PNGf»)
                 set fileRef to open for access tempFile with write permission
@@ -325,7 +444,7 @@ class MacOSClipboardService implements ClipboardService {
                     set fileRef to open for access tempFile with write permission
                     write imageData to fileRef
                     close access fileRef
-                    
+
                     -- Convert to PNG using sips
                     do shell script "sips -s format png " & quoted form of posixPath & " --out " & quoted form of posixPath
                     return posixPath
@@ -337,7 +456,7 @@ class MacOSClipboardService implements ClipboardService {
 
         const result = await this.executeAppleScript(script);
         const output = result.toString().trim();
-        
+
         if (output.startsWith('ERROR:')) {
             throw new Error(output.substring(6));
         }
@@ -375,10 +494,10 @@ class MacOSClipboardService implements ClipboardService {
 
     private async executeCommand(command: string, binary = false): Promise<Buffer> {
         return new Promise((resolve, reject) => {
-            const options = binary 
+            const options = binary
                 ? { encoding: 'buffer' as const, timeout: this.timeout }
                 : { encoding: 'utf8' as const, timeout: this.timeout };
-                
+
             exec(command, options, (error: any, stdout: any, stderr: any) => {
                 if (error) {
                     reject(new Error(`Command failed: ${error.message}\nStderr: ${stderr.toString()}`));
